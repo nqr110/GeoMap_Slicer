@@ -3,6 +3,8 @@ import numpy as np
 from shapely.geometry import Point, Polygon, box
 from shapely.ops import voronoi_diagram, unary_union
 import random
+import math
+from sklearn.cluster import KMeans
 
 # --- 步骤1: 读取金华市边界 ---
 # 将您的文件路径替换为实际路径
@@ -12,20 +14,103 @@ if gdf_jinhua.crs != "EPSG:4326":
     gdf_jinhua = gdf_jinhua.to_crs("EPSG:4326")
 
 # 获取金华市的几何体 (MultiPolygon 或 Polygon)
-jinhua_geom = gdf_jinhua.geometry.unary_union  # 合并所有部分
+jinhua_geom = gdf_jinhua.geometry.union_all()  # 使用新的方法替代deprecated的unary_union
 jinhua_bounds = jinhua_geom.bounds  # (minx, miny, maxx, maxy)
 
-# --- 步骤2: 在边界内生成27个随机点 ---
-num_blocks = 27
-random_points = []
-while len(random_points) < num_blocks:
-    # 在包围盒内随机生成一个点
-    x = random.uniform(jinhua_bounds[0], jinhua_bounds[2])
-    y = random.uniform(jinhua_bounds[1], jinhua_bounds[3])
-    point = Point(x, y)
-    # 检查点是否在金华市边界内
-    if jinhua_geom.contains(point):
-        random_points.append(point)
+# --- 步骤2: 在边界内生成106个更均匀分布的点 ---
+num_blocks = 106
+
+def generate_uniform_points_advanced(geometry, bounds, num_points, max_iterations=50):
+    """
+    使用高级算法生成更均匀分布的点
+    1. 首先生成大量随机点
+    2. 使用K-means聚类找到均匀分布的中心点
+    3. 迭代优化点的位置
+    """
+    # 步骤1: 生成大量随机点作为候选点
+    candidate_points = []
+    attempts = 0
+    max_attempts = num_points * 20  # 生成20倍数量的候选点
+    
+    while len(candidate_points) < max_attempts and attempts < max_attempts * 2:
+        x = random.uniform(bounds[0], bounds[2])
+        y = random.uniform(bounds[1], bounds[3])
+        point = Point(x, y)
+        
+        if geometry.contains(point):
+            candidate_points.append([x, y])
+        
+        attempts += 1
+    
+    if len(candidate_points) < num_points:
+        # 如果候选点不够，直接使用随机点
+        return generate_simple_random_points(geometry, bounds, num_points)
+    
+    # 步骤2: 使用K-means聚类找到均匀分布的中心点
+    candidate_array = np.array(candidate_points)
+    kmeans = KMeans(n_clusters=num_points, random_state=42, n_init=10)
+    cluster_centers = kmeans.fit_predict(candidate_array)
+    
+    # 获取聚类中心
+    centers = kmeans.cluster_centers_
+    
+    # 步骤3: 将聚类中心转换为Point对象，并确保在边界内
+    final_points = []
+    for center in centers:
+        point = Point(center[0], center[1])
+        if geometry.contains(point):
+            final_points.append(point)
+        else:
+            # 如果中心点不在边界内，找到最近的边界内点
+            nearest_point = find_nearest_valid_point(center, geometry, bounds)
+            if nearest_point:
+                final_points.append(nearest_point)
+    
+    # 如果聚类方法没有生成足够的点，补充随机点
+    while len(final_points) < num_points:
+        additional_point = generate_simple_random_points(geometry, bounds, 1)[0]
+        if additional_point not in final_points:
+            final_points.append(additional_point)
+    
+    return final_points[:num_points]
+
+def generate_simple_random_points(geometry, bounds, num_points):
+    """简单的随机点生成方法作为备选"""
+    points = []
+    attempts = 0
+    max_attempts = num_points * 10
+    
+    while len(points) < num_points and attempts < max_attempts:
+        x = random.uniform(bounds[0], bounds[2])
+        y = random.uniform(bounds[1], bounds[3])
+        point = Point(x, y)
+        
+        if geometry.contains(point):
+            points.append(point)
+        
+        attempts += 1
+    
+    return points
+
+def find_nearest_valid_point(center, geometry, bounds, max_attempts=100):
+    """找到最近的边界内点"""
+    center_point = Point(center[0], center[1])
+    
+    # 在中心点周围搜索
+    for radius in np.linspace(0.01, 0.1, 10):
+        for angle in np.linspace(0, 2*np.pi, 20):
+            x = center[0] + radius * np.cos(angle)
+            y = center[1] + radius * np.sin(angle)
+            
+            if bounds[0] <= x <= bounds[2] and bounds[1] <= y <= bounds[3]:
+                point = Point(x, y)
+                if geometry.contains(point):
+                    return point
+    
+    return None
+
+# 生成均匀分布的点
+random_points = generate_uniform_points_advanced(jinhua_geom, jinhua_bounds, num_blocks)
 
 # --- 步骤3 & 4: 创建并裁剪Voronoi图 ---
 # 为了确保Voronoi图覆盖整个区域，我们使用一个更大的包围盒
@@ -35,7 +120,7 @@ gdf_points = gpd.GeoDataFrame(geometry=random_points, crs="EPSG:4326")
 voronoi_bbox = box(jinhua_bounds[0] - 1, jinhua_bounds[1] - 1, 
                    jinhua_bounds[2] + 1, jinhua_bounds[3] + 1)  # 扩大1度
 # 生成Voronoi图
-voronoi_polygons = voronoi_diagram(unary_union(gdf_points.geometry), 
+voronoi_polygons = voronoi_diagram(gdf_points.geometry.union_all(), 
                                    envelope=voronoi_bbox)
 
 # 将Voronoi多边形转换为GeoDataFrame
@@ -93,6 +178,16 @@ gdf_blocks['block_id'] = range(1, len(gdf_blocks) + 1)
 gdf_blocks['name'] = gdf_blocks['block_id'].apply(lambda x: f"区块{x}")
 
 # 保存为新的GeoJSON文件
-gdf_blocks.to_file("金华市_27个随机区块.geojson", driver='GeoJSON')
+gdf_blocks.to_file("金华市_106个随机区块.geojson", driver='GeoJSON')
 
-print("分割完成！结果已保存为 '金华市_27个随机区块.geojson'")
+# 计算更准确的面积统计（使用投影坐标系）
+gdf_blocks_projected = gdf_blocks.to_crs("EPSG:3857")  # Web Mercator投影
+areas = gdf_blocks_projected.geometry.area / 1000000  # 转换为平方公里
+
+print(f"分割完成！生成了{len(gdf_blocks)}个区块，结果已保存为 '金华市_106个随机区块.geojson'")
+print(f"区块面积统计（平方公里）：")
+print(f"  最小面积: {areas.min():.4f} km²")
+print(f"  最大面积: {areas.max():.4f} km²")
+print(f"  平均面积: {areas.mean():.4f} km²")
+print(f"  面积标准差: {areas.std():.4f} km²")
+print(f"  面积变异系数: {(areas.std() / areas.mean() * 100):.2f}%")
